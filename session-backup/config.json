@@ -1,0 +1,12 @@
+{
+  "workspaces": {
+    "nova-act-explore": {
+      "folder": "nova-act-explore",
+      "editor": "vscode",
+      "setupDone": true
+    }
+  },
+  "obsidianVaultPath": "/Users/vaughn.angoy/Documents/Personal",
+  "sessionRoot": "AI Sessions",
+  "sessionRootAsked": true
+}
