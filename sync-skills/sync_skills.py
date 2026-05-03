@@ -260,6 +260,390 @@ def init_config():
         print(f"Created config: {CONFIG_FILE}")
 
 
+# ── --link ─────────────────────────────────────────────────────────────
+
+
+def derive_hub_name(target: Path) -> str:
+    """
+    Derive the SKILLS_HUB directory name from a target path.
+
+    Uses <grandparent.name>-<parent.name> to mirror the GitHub
+    username/repo-name convention, e.g.:
+      ~/code/git-repos/vaughnangoy/ai-skills  →  vaughnangoy-ai-skills
+      ~/code/git-repos/teng-lin/notebooklm-py →  teng-lin-notebooklm-py
+    """
+    t = target.resolve()
+    return f"{t.parent.name}-{t.name}"
+
+
+def _has_skills(path: Path) -> bool:
+    """Return True if path contains at least one <skill>/SKILL.md."""
+    for child in path.iterdir():
+        if child.is_dir() and not child.name.startswith("."):
+            if (child / "SKILL.md").exists():
+                return True
+    return False
+
+
+def link_to_hub(target_str: str, force: bool = False) -> bool:
+    """
+    Create a symlink in SKILLS_HUB pointing at target_str, then sync.
+
+    Hub name is derived as <grandparent>-<target.name>.  Handles:
+    - New link: create straightforwardly.
+    - Existing symlink to same target: no-op.
+    - Existing symlink to different target: update silently.
+    - Existing real dir whose skill subdirs are all present in target:
+      migrate silently (replace with symlink).
+    - Existing real dir with content not in target: require --force.
+
+    Special case: when SKILLS_HUB resolves to the same directory as
+    SKILLS_DIR (e.g. ~/.claude/skills → ~/code/SKILLS_HUB), a
+    namespace-level symlink can't be used (sync_skills would overwrite it
+    with a real dir).  In that case, individual skill symlinks are created
+    directly pointing at the repo, which is functionally equivalent.
+    """
+    config = load_config()
+    hub = Path(config["watch_path"]).expanduser()
+    target = Path(target_str).expanduser().resolve()
+
+    if not target.exists():
+        print(f"❌  Target does not exist: {target}", file=sys.stderr)
+        return False
+
+    if not _has_skills(target):
+        print(
+            f"❌  No skills found in target (expected subdirs containing SKILL.md): {target}",
+            file=sys.stderr,
+        )
+        return False
+
+    hub_name = derive_hub_name(target)
+    link_path = hub / hub_name
+    hub.mkdir(parents=True, exist_ok=True)
+
+    # Detect the SKILLS_HUB == SKILLS_DIR case (e.g. ~/.claude/skills → SKILLS_HUB).
+    hub_is_skills_dir = hub.resolve() == SKILLS_DIR.resolve()
+
+    skill_dirs = [
+        d for d in sorted(target.iterdir())
+        if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").exists()
+    ]
+
+    if hub_is_skills_dir:
+        # Hub and SKILLS_DIR are the same location. A namespace-level symlink
+        # would be overwritten by symlink_skill's migration code. Instead, use
+        # SKILLS_DIR/hub_name as a real directory with per-skill symlinks that
+        # point directly to the repo (not through SKILLS_HUB).
+        link_path.mkdir(parents=True, exist_ok=True)
+        print(f"✓  {hub_name}: SKILLS_HUB == SKILLS_DIR, creating per-skill symlinks → {target}")
+
+        registry = load_registry()
+        target_skill_names = {d.name for d in skill_dirs}
+
+        # ── Cleanup: remove stale skill entries no longer in target ──
+        removed = []
+        if link_path.exists():
+            for existing in sorted(link_path.iterdir()):
+                if existing.name.startswith("."):
+                    continue
+                if existing.name not in target_skill_names:
+                    if existing.is_symlink():
+                        existing.unlink()
+                        removed.append(existing.name)
+                        print(f"  🗑  {hub_name}/{existing.name}: removed (no longer in repo)")
+                    stale_instr = INSTRUCTIONS_DIR / f"{hub_name}-{existing.name}.instructions.md"
+                    if stale_instr.exists():
+                        stale_instr.unlink()
+                    stale_key = skill_key(hub_name, existing.name)
+                    if stale_key in registry:
+                        del registry[stale_key]
+
+        added = []
+        updated = []
+        unchanged = []
+
+        for skill_dir in skill_dirs:
+            skill_name = skill_dir.name
+            skill_source = target / skill_name  # Direct link to the repo subdir
+            skill_link = link_path / skill_name
+
+            if skill_link.is_symlink():
+                if skill_link.resolve() == skill_source.resolve():
+                    unchanged.append(skill_name)
+                else:
+                    skill_link.unlink()
+                    skill_link.symlink_to(skill_source)
+                    updated.append(skill_name)
+                    print(f"  ↺ {hub_name}/{skill_name}: updated symlink → {skill_source}")
+            elif skill_link.exists():
+                print(f"  · {hub_name}/{skill_name}: already exists as non-symlink, skipping")
+                unchanged.append(skill_name)
+                continue
+            else:
+                skill_link.symlink_to(skill_source)
+                added.append(skill_name)
+
+            skill = {
+                "namespace": hub_name,
+                "name": skill_name,
+                "source_path": str(skill_source),
+            }
+            write_instructions_file(skill)
+            registry[skill_key(hub_name, skill_name)] = str(skill_source)
+
+        save_registry(registry)
+
+    else:
+        # Normal case: SKILLS_HUB is a separate directory from SKILLS_DIR.
+        # Create a namespace-level symlink in SKILLS_HUB, then let sync_skills
+        # create individual skill symlinks in SKILLS_DIR.
+        added = updated = removed = unchanged = []  # tracked by sync_skills() output
+
+        if link_path.is_symlink():
+            existing_target = link_path.resolve()
+            if existing_target == target:
+                print(f"· {hub_name}: already linked → {target}")
+            else:
+                print(f"↺  {hub_name}: updating symlink {existing_target} → {target}")
+                link_path.unlink()
+                link_path.symlink_to(target)
+        elif link_path.exists():
+            # Real directory — check if content is a strict subset of target skill names
+            hub_skill_names = {
+                d.name for d in link_path.iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            }
+            target_skill_names = {d.name for d in skill_dirs}
+            extra = hub_skill_names - target_skill_names
+            if extra and not force:
+                print(
+                    f"❌  {hub_name}: real directory exists with skills not in target: "
+                    f"{', '.join(sorted(extra))}\n"
+                    f"    Use --force to replace it with a symlink.",
+                    file=sys.stderr,
+                )
+                return False
+            print(f"↺  {hub_name}: replacing real directory with symlink → {target}")
+            import shutil
+            shutil.rmtree(link_path)
+            link_path.symlink_to(target)
+        else:
+            link_path.symlink_to(target)
+            print(f"✓  {hub_name}: linked → {target}")
+
+        # Sync all skills in the new namespace
+        print(f"\nSyncing skills in {hub_name}...")
+        sync_skills(all_mode=True)
+
+    # ── Verify ────────────────────────────────────────────────────────
+    print()
+    ok = verify_link(hub_name, hub)
+
+    # ── Binary check ──────────────────────────────────────────────────
+    bin_path = Path.home() / ".local" / "bin" / "sync-skills"
+    this_script = Path(__file__).resolve()
+    bin_ok = (
+        bin_path.is_symlink()
+        and bin_path.resolve() == this_script
+    )
+    _check_binary()
+
+    # ── Final summary ─────────────────────────────────────────────────
+    total_skills = len(skill_dirs) if hub_is_skills_dir else len(
+        [d for d in link_path.iterdir()
+         if d.is_dir() and not d.name.startswith(".")]
+        if link_path.exists() else []
+    )
+    print()
+    print("─" * 54)
+    print(f"  Namespace : {hub_name}")
+    print(f"  Source    : {target}")
+    if hub_is_skills_dir:
+        print(f"  Skills    : {len(skill_dirs)} total  "
+              f"| {len(added)} added  "
+              f"| {len(updated)} updated  "
+              f"| {len(removed)} removed")
+    else:
+        print(f"  Skills    : {total_skills} total (see sync output above)")
+    print(f"  Chain     : {'✅ all checks passed' if ok else '❌ some checks failed — run: sync-skills --all'}")
+    print(f"  Binary    : {'✅ installed at ' + str(bin_path) if bin_ok else '⚠  not installed — run: bash ' + str(Path(__file__).parent / 'setup' / 'install.sh')}")
+    print("─" * 54)
+
+    return ok
+
+
+def verify_link(hub_name: str, hub: Path | None = None) -> bool:
+    """
+    Verify the full chain for every skill in a SKILLS_HUB namespace:
+      Normal (hub ≠ SKILLS_DIR):
+        1. SKILLS_HUB/<hub-name>  is a symlink to a live directory
+        2. ~/.claude/skills/<hub-name>/<skill>  is a valid symlink
+      Collapsed (hub == SKILLS_DIR):
+        1. SKILLS_HUB/<hub-name>  exists as a directory
+        2. SKILLS_HUB/<hub-name>/<skill>  is a symlink to the repo skill
+
+      Both:
+        3. ~/.copilot/instructions/<hub-name>-<skill>.instructions.md  exists
+        4. Copilot CLI instructions dir is configured
+
+    Prints a table and returns True if all checks pass.
+    """
+    if hub is None:
+        config = load_config()
+        hub = Path(config["watch_path"]).expanduser()
+
+    link_path = hub / hub_name
+    hub_is_skills_dir = hub.resolve() == SKILLS_DIR.resolve()
+
+    # Check 1: hub entry exists
+    if not link_path.exists():
+        print(f"❌  SKILLS_HUB/{hub_name} does not exist — run sync-skills --link <path> first")
+        return False
+
+    if hub_is_skills_dir:
+        # In collapsed mode the namespace IS a real directory in SKILLS_DIR.
+        hub_ok = link_path.is_dir() and not link_path.is_symlink()
+    else:
+        hub_ok = link_path.is_symlink() and link_path.resolve().exists()
+
+    # Collect skills in the namespace
+    skills_in_ns = [
+        d.name for d in link_path.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+        and (
+            (d.is_symlink() and d.resolve().exists() and (d.resolve() / "SKILL.md").exists())
+            or ((d / "SKILL.md").exists())
+        )
+    ]
+    if not skills_in_ns:
+        print(f"⚠  No skills found under SKILLS_HUB/{hub_name}")
+        return False
+
+    # Check 4: instructions dir configured
+    env_ok = _check_instructions_env()
+
+    all_pass = hub_ok and env_ok
+    col_w = max(len(s) for s in skills_in_ns) + 2
+
+    print(f"Verification: {hub_name}")
+    hub_label = "real directory" if hub_is_skills_dir else "symlink"
+    print(f"  SKILLS_HUB entry ({hub_label}): {'✅' if hub_ok else '❌'}")
+    print(f"  Instructions env               : {'✅' if env_ok else '❌  COPILOT_CUSTOM_INSTRUCTIONS_DIRS not set'}")
+    print()
+
+    if hub_is_skills_dir:
+        # In collapsed mode: check the individual skill symlinks in link_path
+        print(f"  {'Skill':<{col_w}}  Skill symlink  Copilot .md")
+        print(f"  {'-' * col_w}  -------------  -----------")
+        for skill_name in sorted(skills_in_ns):
+            skill_link = link_path / skill_name
+            skill_ok = skill_link.is_symlink() and skill_link.resolve().exists()
+            instr_file = INSTRUCTIONS_DIR / f"{hub_name}-{skill_name}.instructions.md"
+            instr_ok = instr_file.exists() and instr_file.stat().st_size > 0
+            all_pass = all_pass and skill_ok and instr_ok
+            print(
+                f"  {skill_name:<{col_w}}  "
+                f"{'✅' if skill_ok else '❌'}             "
+                f"{'✅' if instr_ok else '❌'}"
+            )
+    else:
+        # Normal mode: check the per-skill symlinks in SKILLS_DIR
+        print(f"  {'Skill':<{col_w}}  Claude symlink  Copilot .md")
+        print(f"  {'-' * col_w}  --------------  -----------")
+        for skill_name in sorted(skills_in_ns):
+            claude_target = SKILLS_DIR / hub_name / skill_name
+            claude_ok = claude_target.is_symlink() and claude_target.resolve().exists()
+            instr_file = INSTRUCTIONS_DIR / f"{hub_name}-{skill_name}.instructions.md"
+            instr_ok = instr_file.exists() and instr_file.stat().st_size > 0
+            all_pass = all_pass and claude_ok and instr_ok
+            print(
+                f"  {skill_name:<{col_w}}  "
+                f"{'✅' if claude_ok else '❌'}              "
+                f"{'✅' if instr_ok else '❌'}"
+            )
+
+    print()
+    if all_pass:
+        print(f"✅  All checks passed for {hub_name}")
+    else:
+        print(f"❌  Some checks failed — run: sync-skills --all")
+
+    return all_pass
+
+
+def _check_instructions_env() -> bool:
+    """Check whether COPILOT_CUSTOM_INSTRUCTIONS_DIRS is configured."""
+    import os
+
+    # Check current process env
+    if os.environ.get("COPILOT_CUSTOM_INSTRUCTIONS_DIRS"):
+        return True
+
+    # Check VS Code settings as a fallback
+    vscode_settings = _vscode_settings_path()
+    if vscode_settings and vscode_settings.exists():
+        try:
+            import re as _re
+            raw = vscode_settings.read_text()
+            if "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" in raw:
+                return True
+        except Exception:
+            pass
+
+    # Check shell profiles
+    for profile in ("~/.zshrc", "~/.zprofile", "~/.bashrc", "~/.bash_profile"):
+        p = Path(profile).expanduser()
+        if p.exists() and "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" in p.read_text():
+            return True
+
+    return False
+
+
+def _vscode_settings_path() -> Path | None:
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        return Path.home() / "Library/Application Support/Code/User/settings.json"
+    if system == "Linux":
+        return Path.home() / ".config/Code/User/settings.json"
+    return None
+
+
+def _check_binary():
+    """
+    Check that ~/.local/bin/sync-skills exists and is a symlink to this script.
+    Prints a warning with the install command if not.
+    """
+    bin_path = Path.home() / ".local" / "bin" / "sync-skills"
+    this_script = Path(__file__).resolve()
+
+    if not bin_path.exists() and not bin_path.is_symlink():
+        print(
+            f"⚠  sync-skills binary not installed at {bin_path}\n"
+            f"   Run the installer to set it up:\n"
+            f"   bash {this_script.parent}/setup/install.sh"
+        )
+        return
+
+    if bin_path.is_symlink():
+        target = bin_path.resolve()
+        if target == this_script:
+            print(f"✅  sync-skills binary: {bin_path} → {this_script}")
+        else:
+            print(
+                f"⚠  sync-skills binary points to a different file:\n"
+                f"   {bin_path} → {target}\n"
+                f"   Expected: {this_script}\n"
+                f"   Re-run installer to fix: bash {this_script.parent}/setup/install.sh"
+            )
+    else:
+        print(
+            f"⚠  {bin_path} exists but is not a symlink — it may be stale.\n"
+            f"   Re-run installer to fix: bash {this_script.parent}/setup/install.sh"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sync skills from a watch path to ~/.claude/skills/"
@@ -279,11 +663,38 @@ def main():
         action="store_true",
         help="Create default config file",
     )
+    parser.add_argument(
+        "--link",
+        metavar="PATH",
+        help=(
+            "Link a skill namespace from a git repo into SKILLS_HUB. "
+            "PATH should be the repo root containing skill subdirectories. "
+            "Hub name is derived as <parent>-<repo> (e.g. vaughnangoy-ai-skills)."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --link: replace an existing real directory even if it has diverged content",
+    )
+    parser.add_argument(
+        "--verify",
+        metavar="HUB_NAME",
+        help="Verify the full chain for a linked namespace (e.g. vaughnangoy-ai-skills)",
+    )
     args = parser.parse_args()
 
     if args.init:
         init_config()
         return
+
+    if args.link:
+        ok = link_to_hub(args.link, force=args.force)
+        sys.exit(0 if ok else 1)
+
+    if args.verify:
+        ok = verify_link(args.verify)
+        sys.exit(0 if ok else 1)
 
     if args.watch_path:
         # Temporarily override config
