@@ -232,15 +232,15 @@ def install_faster_whisper() -> bool:
     print(f"     Creating uv venv at {UV_ENV_DIR}...")
     UV_ENV_DIR.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
-        ["uv", "venv", str(UV_ENV_DIR), "--python", "3.12"],
+        ["uv", "venv", str(UV_ENV_DIR), "--python", "3.12", "--clear"],
         capture_output=False,
     )
     if r.returncode != 0:
         return False
-    pip = UV_ENV_DIR / "bin" / "pip"
-    print("     Installing faster-whisper...")
+    print("     Installing faster-whisper via uv pip...")
     r = subprocess.run(
-        [str(pip), "install", "faster-whisper"],
+        ["uv", "pip", "install", "faster-whisper",
+         "--python", str(UV_ENV_DIR / "bin" / "python")],
         capture_output=False,
     )
     if r.returncode != 0:

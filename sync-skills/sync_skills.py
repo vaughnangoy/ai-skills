@@ -137,6 +137,11 @@ def symlink_skill(skill: dict, dry_run: bool = False) -> bool:
     target = target_ns_dir / name
 
     if not dry_run:
+        # If namespace dir is itself a symlink, migrate to a real directory so
+        # Copilot CLI can discover individual skills inside it as plugin skills.
+        if target_ns_dir.is_symlink():
+            print(f"  [migrate] {namespace}/: namespace symlink → real directory")
+            target_ns_dir.unlink()
         target_ns_dir.mkdir(parents=True, exist_ok=True)
 
     if target.exists() and not target.is_symlink():

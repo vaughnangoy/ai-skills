@@ -30,6 +30,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +39,35 @@ from pathlib import Path
 UV_ENV_DIR = Path("~/.copilot/skills/secondbrain-transcribe-audio-skill/venv").expanduser()
 _UV_PYTHON = UV_ENV_DIR / "bin" / "python"
 _WHISPER_PYTHON = str(_UV_PYTHON) if _UV_PYTHON.exists() else sys.executable
+
+# ── SecondBrain config ────────────────────────────────────────────────
+
+SKILL_CONFIG = Path("~/.copilot/skills/secondbrain-notebooklm-skill/config.json").expanduser()
+
+
+def _secondbrain_path() -> Path | None:
+    if SKILL_CONFIG.exists():
+        try:
+            data = json.loads(SKILL_CONFIG.read_text())
+            p = data.get("secondbrain_path")
+            return Path(p) if p else None
+        except Exception:
+            pass
+    return None
+
+
+def run_ingest(secondbrain_path: Path) -> bool:
+    ingest = secondbrain_path / "scripts" / "ingest.py"
+    if not ingest.exists():
+        fail(f"ingest.py not found at {ingest}")
+        return False
+    print(f"\n🔄  Ingesting into SecondBrain ...")
+    result = subprocess.run(
+        ["uv", "run", "python", str(ingest), "--pending"],
+        cwd=str(secondbrain_path),
+    )
+    return result.returncode == 0
+
 
 # ── Colour helpers ─────────────────────────────────────────────────────
 
@@ -120,7 +150,7 @@ def download_audio(
 
 # ── Transcription ──────────────────────────────────────────────────────
 
-def transcribe_audio(audio_path: Path) -> dict | None:
+def transcribe_audio(audio_path: Path, show_progress: bool = True) -> dict | None:
     """
     Transcribe audio_path using faster-whisper (medium model, device=auto).
     Returns dict with keys: text, segments, duration_seconds, language.
@@ -137,11 +167,13 @@ except ImportError:
     sys.exit(1)
 
 audio_path = Path(sys.argv[1])
+show_progress = len(sys.argv) > 2 and sys.argv[2] == "1"
 model = WhisperModel("medium", device="auto", compute_type="auto")
 segments_iter, info = model.transcribe(str(audio_path), beam_size=5)
 
 segments = []
 full_text = []
+duration = round(info.duration, 1) if info.duration else None
 for seg in segments_iter:
     segments.append({
         "start": round(seg.start, 2),
@@ -150,29 +182,56 @@ for seg in segments_iter:
     })
     full_text.append(seg.text.strip())
 
+    if show_progress and duration:
+        pct = min(100.0, (seg.end / duration) * 100.0)
+        print(f"[transcribe] {pct:5.1f}% ({seg.end:6.1f}s / {duration:6.1f}s)", file=sys.stderr, flush=True)
+
+if show_progress:
+    print("[transcribe] 100.0% complete", file=sys.stderr, flush=True)
+
 print(json.dumps({
     "text": " ".join(full_text),
     "segments": segments,
-    "duration_seconds": round(info.duration, 1) if info.duration else None,
+    "duration_seconds": duration,
     "language": info.language,
 }))
 """
-    result = subprocess.run(
-        [_WHISPER_PYTHON, "-c", script, str(audio_path)],
-        capture_output=True,
+    proc = subprocess.Popen(
+        [_WHISPER_PYTHON, "-c", script, str(audio_path), "1" if show_progress else "0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,
     )
-    if result.returncode != 0:
-        fail(f"Transcription failed:\n{result.stderr[:500]}")
+
+    stderr_chunks: list[str] = []
+    assert proc.stderr is not None
+    assert proc.stdout is not None
+
+    def _drain_stderr() -> None:
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            if show_progress:
+                print(f"     {line.rstrip()}", flush=True)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    stdout_text = proc.stdout.read()
+    stderr_thread.join()
+    rc = proc.wait()
+
+    if rc != 0:
+        fail(f"Transcription failed:\n{''.join(stderr_chunks)[-500:]}")
         return None
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(stdout_text)
         if "error" in data:
             fail(data["error"])
             return None
         return data
     except json.JSONDecodeError:
-        fail(f"Could not parse transcription output: {result.stdout[:300]}")
+        fail(f"Could not parse transcription output: {stdout_text[:300]}")
         return None
 
 
@@ -334,6 +393,12 @@ def main() -> None:
     parser.add_argument("--notebook-title", default="Notebook",
                         help="Human-readable notebook title")
     parser.add_argument("--out-dir", help="Output directory for audio")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable live terminal progress output during transcription")
+    parser.add_argument("--no-ingest", action="store_true",
+                        help="Skip automatic ingest after transcription")
+    parser.add_argument("--secondbrain-path",
+                        help="Override SecondBrain path (default: read from config)")
     args = parser.parse_args()
 
     # ── Transcribe-only mode ──────────────────────────────────────────
@@ -347,7 +412,7 @@ def main() -> None:
             sys.exit(1)
 
         print(f"\n🎙️  Transcribing {audio_path.name} ...")
-        transcript = transcribe_audio(audio_path)
+        transcript = transcribe_audio(audio_path, show_progress=not args.no_progress)
         if not transcript:
             sys.exit(1)
 
@@ -362,6 +427,12 @@ def main() -> None:
         ok(f"Transcript → {md_path.name}")
         ok(f"Words: {transcript.get('text','').count(' ') + 1}  |  "
            f"Duration: {transcript.get('duration_seconds', '?')}s")
+        if not args.no_ingest:
+            sb = Path(args.secondbrain_path) if args.secondbrain_path else _secondbrain_path()
+            if sb:
+                run_ingest(sb)
+            else:
+                info("SecondBrain path not configured — skipping ingest. Use --secondbrain-path or set it in config.")
         return
 
     # ── Download (+ optional transcribe) mode ─────────────────────────
@@ -390,7 +461,7 @@ def main() -> None:
 
     # Proceed to transcribe
     print(f"\n🎙️  Transcribing ...")
-    transcript = transcribe_audio(audio_path)
+    transcript = transcribe_audio(audio_path, show_progress=not args.no_progress)
     if not transcript:
         print(f"\n{YELLOW}⚠️  Transcription failed — audio saved but not transcribed.{RESET}")
         print(f"   Retry later: python audio_transcribe.py --transcribe --audio {audio_path} "
@@ -409,9 +480,14 @@ def main() -> None:
     ok(f"Transcript → {md_path.name}")
     info(f"Words: {transcript.get('text','').count(' ') + 1}  |  "
          f"Duration: {transcript.get('duration_seconds', '?')}s")
-    print(f"\n✅ Ready to ingest:")
-    print(f"   {audio_path}")
-    print(f"   {md_path}")
+    if not args.no_ingest:
+        sb = Path(args.secondbrain_path) if args.secondbrain_path else _secondbrain_path()
+        if sb:
+            run_ingest(sb)
+        else:
+            info("SecondBrain path not configured — skipping ingest. Use --secondbrain-path or set it in config.")
+            print(f"\n   {audio_path}")
+            print(f"   {md_path}")
 
 
 if __name__ == "__main__":
