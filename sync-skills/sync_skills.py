@@ -66,6 +66,11 @@ def find_skills(watch_path: Path) -> list[dict]:
     for namespace_dir in sorted(watch_path.iterdir()):
         if not namespace_dir.is_dir() or namespace_dir.name.startswith("."):
             continue
+        # Skip flat skill dirs. When hub == SKILLS_DIR, flat symlinks are
+        # created at depth 1 for Claude Code discovery; they should not be
+        # treated as namespace directories by find_skills.
+        if (namespace_dir / "SKILL.md").exists():
+            continue
         for skill_dir in sorted(namespace_dir.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
@@ -82,6 +87,33 @@ def find_skills(watch_path: Path) -> list[dict]:
 
 def skill_key(namespace: str, name: str) -> str:
     return f"{namespace}/{name}"
+
+
+def find_standalone_skills(watch_path: Path, exclude_names: set | None = None) -> list[dict]:
+    """
+    Find standalone skills in watch_path — entries with SKILL.md at root
+    that are not part of a namespace collection. These are single-skill repos
+    linked directly into SKILLS_HUB. exclude_names filters out flat symlinks
+    already accounted for as namespace skills.
+    """
+    exclude_names = exclude_names or set()
+    skills = []
+    if not watch_path.exists():
+        return skills
+    for entry in sorted(watch_path.iterdir()):
+        if entry.name.startswith(".") or not entry.is_dir():
+            continue
+        if entry.name in exclude_names:
+            continue
+        if (entry / "SKILL.md").exists():
+            skills.append(
+                {
+                    "namespace": "__standalone__",
+                    "name": entry.name,
+                    "source_path": str(entry.resolve()),
+                }
+            )
+    return skills
 
 
 def parse_skill_frontmatter(skill_md: Path) -> dict:
@@ -119,7 +151,9 @@ def write_instructions_file(skill: dict):
     description = fm.get("description", "")
     body = skill_body(skill_md)
 
-    out = INSTRUCTIONS_DIR / f"{skill['namespace']}-{skill['name']}.instructions.md"
+    ns = skill["namespace"]
+    instr_name = f"{ns}-{skill['name']}" if ns and ns != "__standalone__" else skill["name"]
+    out = INSTRUCTIONS_DIR / f"{instr_name}.instructions.md"
     content = f'---\napplyTo: "**"\n---\n# Skill: {name}\n\n'
     if description:
         content += f"> {description}\n\n"
@@ -168,9 +202,13 @@ def sync_skills(all_mode: bool = False):
     registry = load_registry()
 
     discovered = find_skills(watch_path)
-    if not discovered:
-        print("No skills found in watch path.")
-        return
+    namespace_names = {s["name"] for s in discovered}
+    standalone_skills = find_standalone_skills(watch_path, exclude_names=namespace_names)
+    if not discovered and not standalone_skills:
+        if not all_mode:
+            print("No skills found in watch path.")
+            return
+        # In --all mode fall through so stale cleanup can remove old registry entries.
 
     added = []
     repaired = []
@@ -211,19 +249,44 @@ def sync_skills(all_mode: bool = False):
         else:
             skipped.append(key)
 
+    # Process standalone skills (single-skill repos linked directly into SKILLS_HUB).
+    # These have SKILL.md at root and are not part of any namespace collection.
+    # (standalone_skills is computed at the top of sync_skills alongside discovered)
+    for skill in standalone_skills:
+        key = skill_key(skill["namespace"], skill["name"])
+        if key in registry and not all_mode:
+            already_linked.append(key)
+            continue
+        is_new = key not in registry
+        registry[key] = skill["source_path"]
+        write_instructions_file(skill)
+        if is_new:
+            added.append(key)
+        else:
+            already_linked.append(key)
+
     if all_mode:
         # Check for registered skills that no longer exist in watch path
         discovered_keys = {skill_key(s["namespace"], s["name"]) for s in discovered}
-        stale = [k for k in list(registry.keys()) if k not in discovered_keys]
+        standalone_keys = {skill_key(s["namespace"], s["name"]) for s in standalone_skills}
+        stale = [k for k in list(registry.keys()) if k not in discovered_keys | standalone_keys]
         for key in stale:
             ns, name = key.split("/", 1)
-            target = SKILLS_DIR / ns / name
-            if target.is_symlink():
-                target.unlink()
-            stale_instructions = INSTRUCTIONS_DIR / f"{ns}-{name}.instructions.md"
+            stale_source = Path(registry[key]).resolve()
+            if ns != "__standalone__":
+                target = SKILLS_DIR / ns / name
+                if target.is_symlink():
+                    target.unlink()
+                # Remove the flat symlink at SKILLS_DIR root if it points to the same source.
+                flat_link = SKILLS_DIR / name
+                if flat_link.is_symlink() and flat_link.resolve() == stale_source:
+                    flat_link.unlink()
+            instr_name = name if ns == "__standalone__" else f"{ns}-{name}"
+            stale_instructions = INSTRUCTIONS_DIR / f"{instr_name}.instructions.md"
             if stale_instructions.exists():
                 stale_instructions.unlink()
-            print(f"  [removed] {key}: source no longer exists")
+            display_key = name if ns == "__standalone__" else key
+            print(f"  [removed] {display_key}: source no longer exists")
             del registry[key]
 
     save_registry(registry)
@@ -335,6 +398,17 @@ def link_to_hub(target_str: str, force: bool = False) -> bool:
         # would be overwritten by symlink_skill's migration code. Instead, use
         # SKILLS_DIR/hub_name as a real directory with per-skill symlinks that
         # point directly to the repo (not through SKILLS_HUB).
+
+        # If a namespace-level symlink already exists (e.g. from a manual setup
+        # or an older version of this tool), remove it before creating the real
+        # directory.  Without this, mkdir(exist_ok=True) silently follows the
+        # symlink and subsequent skill-link creation hits the repo's own dirs,
+        # causing every skill to be skipped as "already exists as non-symlink".
+        if link_path.is_symlink():
+            old_target = link_path.resolve()
+            link_path.unlink()
+            print(f"  [migrate] {hub_name}: removed namespace-level symlink → {old_target}")
+
         link_path.mkdir(parents=True, exist_ok=True)
         print(f"✓  {hub_name}: SKILLS_HUB == SKILLS_DIR, creating per-skill symlinks → {target}")
 
@@ -349,9 +423,15 @@ def link_to_hub(target_str: str, force: bool = False) -> bool:
                     continue
                 if existing.name not in target_skill_names:
                     if existing.is_symlink():
+                        stale_source = existing.resolve()
                         existing.unlink()
                         removed.append(existing.name)
                         print(f"  🗑  {hub_name}/{existing.name}: removed (no longer in repo)")
+                        # Also remove the flat symlink at SKILLS_HUB root if it
+                        # points to the same source as the namespace skill we just removed.
+                        flat_link = hub / existing.name
+                        if flat_link.is_symlink() and flat_link.resolve() == stale_source:
+                            flat_link.unlink()
                     stale_instr = INSTRUCTIONS_DIR / f"{hub_name}-{existing.name}.instructions.md"
                     if stale_instr.exists():
                         stale_instr.unlink()
@@ -383,6 +463,19 @@ def link_to_hub(target_str: str, force: bool = False) -> bool:
             else:
                 skill_link.symlink_to(skill_source)
                 added.append(skill_name)
+
+            # Create a flat symlink at SKILLS_HUB root for Claude Code skill
+            # discovery. Claude Code only loads SKILL.md at depth 1:
+            #   ~/.claude/skills/<skill>/SKILL.md
+            # Without this, namespaced skills at depth 2 are invisible to it.
+            flat_link = hub / skill_name
+            if not flat_link.exists() and not flat_link.is_symlink():
+                flat_link.symlink_to(skill_source)
+            elif flat_link.is_symlink() and flat_link.resolve() != skill_source.resolve():
+                # Another namespace already owns this skill name at the hub root.
+                # First-linked namespace wins; later ones skip silently.
+                pass
+            # else: already a symlink to the correct source — no-op.
 
             skill = {
                 "namespace": hub_name,
@@ -534,17 +627,21 @@ def verify_link(hub_name: str, hub: Path | None = None) -> bool:
 
     if hub_is_skills_dir:
         # In collapsed mode: check the individual skill symlinks in link_path
-        print(f"  {'Skill':<{col_w}}  Skill symlink  Copilot .md")
-        print(f"  {'-' * col_w}  -------------  -----------")
+        print(f"  {'Skill':<{col_w}}  Skill symlink  Flat (Claude)  Copilot .md")
+        print(f"  {'-' * col_w}  -------------  -------------  -----------")
         for skill_name in sorted(skills_in_ns):
             skill_link = link_path / skill_name
             skill_ok = skill_link.is_symlink() and skill_link.resolve().exists()
+            # Flat symlink at SKILLS_HUB root enables Claude Code to discover the skill.
+            flat_link = hub / skill_name
+            flat_ok = flat_link.is_symlink() and flat_link.resolve().exists()
             instr_file = INSTRUCTIONS_DIR / f"{hub_name}-{skill_name}.instructions.md"
             instr_ok = instr_file.exists() and instr_file.stat().st_size > 0
-            all_pass = all_pass and skill_ok and instr_ok
+            all_pass = all_pass and skill_ok and flat_ok and instr_ok
             print(
                 f"  {skill_name:<{col_w}}  "
                 f"{'✅' if skill_ok else '❌'}             "
+                f"{'✅' if flat_ok else '❌'}             "
                 f"{'✅' if instr_ok else '❌'}"
             )
     else:
