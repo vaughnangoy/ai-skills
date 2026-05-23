@@ -33,7 +33,8 @@ This skill is the agent-facing companion to the [`worktree-strategy`](https://gi
 | **Main worktree** | The original clone at `<repo-root>/`, permanently on the default branch |
 | **Feature worktree** | A sibling dir at `<repo-root>-worktrees/<type>/<name>/` where work happens |
 | **Worktrees root** | The sibling parent dir `<repo-root>-worktrees/` that contains all feature worktrees for one repo |
-| **Push trigger** | The 5 conditions (unit + integration + e2e green, docs updated, CHANGELOG entry added) that gate every push |
+| **Push trigger** | The 5 conditions (unit + integration + e2e green, docs + e2e doc updated, CHANGELOG entry added) that gate every push |
+| **E2E doc** | The per-feature spec at `<feature_worktree_root>/docs/e2e/<feature-name>-YYYY-MM-DD.md` capturing every e2e scenario (2 happy + 1 sad minimum) — one file per feature, dated at first creation, appended-to as scenarios grow |
 
 ---
 
@@ -289,6 +290,16 @@ Common test runners by ecosystem (always `cd` into the **feature worktree**, nev
 | Ruby | `cd <feature_worktree_root> && bundle exec rspec <test-file>` |
 | Swift | `cd <feature_worktree_root> && swift test --filter <TestName>` |
 
+**End-to-end runners** — pick the one that matches the layer under test:
+
+| Layer | Runner |
+|---|---|
+| Web UI | `npx playwright test <spec>` or `npx cypress run --spec <spec>` |
+| HTTP API (Node) | `npx jest tests/e2e/` (with `supertest`) against a running app |
+| HTTP API (Python) | `uv run python -m pytest tests/e2e/ -v` (with `requests` / `httpx`) against a running app |
+| CLI / shell tool | `bats tests/e2e/*.bats` or a shell script that exercises the binary end-to-end |
+| Background job / pipeline | a script that submits a job and asserts the side effects (files written, DB rows, queue messages) |
+
 Do **not** use `run_in_background`. Tests must run in the foreground so output is visible to the user.
 
 Confirm the test fails with the expected error (import error, attribute error, assertion error, etc.) before continuing.
@@ -321,24 +332,105 @@ Read `/tmp/.fc_fulltest_out`. Check for:
 >
 > I'll pause here and investigate before continuing.
 
-Diagnose and fix the regression before proceeding to Step 6.
+Diagnose and fix the regression before proceeding to Step 5e.
 
-#### Step 5e — Confirm the task is working
+#### Step 5e — End-to-end coverage and documentation
 
-Once all tests pass, verify the feature behaves correctly if there's a way to check beyond tests (e.g., a script output, a CLI invocation, a UI check). Report to the user:
+If the change is **user-observable** (new endpoint, new CLI command, new UI flow, new file output, new pipeline behaviour), you must add e2e coverage **before** moving to the push gate.
 
-> ✅ **Task complete — all tests pass, no regressions.**
+**When e2e is NOT required**:
+- Pure internal refactor with no observable behaviour change
+- Docs-only change
+- Test-only change
+- Config tweak with no runtime effect
+
+In those cases, note in the commit body why e2e was skipped and continue to Step 5f.
+
+##### Coverage pattern (minimum)
+
+- **2 happy-path scenarios** — different valid inputs that exercise the main flow end-to-end
+- **1 sad-path scenario** — invalid input, missing dependency, or expected failure mode
+
+Run them with the appropriate e2e runner (see Step 5b's end-to-end runners table). All three must pass.
+
+##### Document the scenarios in `docs/e2e/<feature-name>-YYYY-MM-DD.md`
+
+Every feature gets a dedicated e2e spec at:
+
+```
+<feature_worktree_root>/docs/e2e/<feature-name>-YYYY-MM-DD.md
+```
+
+Rules:
+- `<feature-name>` = the feature branch slug, kebab-case (e.g. `add-dark-mode`, `auth-refresh-rotation`)
+- `YYYY-MM-DD` = the date the doc was **first created** — this date does not change as the file grows
+- **One file per feature.** Append new scenarios to the existing file as the feature grows; do not create a new file per task
+- The file is committed in the **same commit** as the e2e test code it describes
+
+##### File template
+
+```markdown
+# E2E test plan: <feature title>
+
+**Created:** YYYY-MM-DD
+**Feature branch:** `feature/<name>`
+**Source of truth:** link to the spec, PRD, SKILL.md, or design doc that drives this feature
+**Test status:** spec / partial / executable
+
+---
+
+## Scenario 1 (happy) — <short descriptive name>
+
+**Setup**
+- preconditions, fixtures, env vars, services that must be running
+
+**Steps**
+1. concrete user-observable action
+2. concrete user-observable action
+
+**Expected**
+- observable outcome 1
+- observable outcome 2
+
+---
+
+## Scenario 2 (happy) — <short descriptive name>
+
+…
+
+---
+
+## Scenario 3 (sad) — <short descriptive name>
+
+…
+
+---
+
+## How to execute
+
+- `<command to spin up any required services>`
+- `<command to run these scenarios>`
+- `<command to tear down>`
+```
+
+If the scenarios are not yet runnable as automated tests (spec-only), mark `**Test status:** spec` and note what's blocking execution in the **How to execute** section.
+
+#### Step 5f — Confirm the task is working
+
+Once all tests pass (unit + integration + e2e, where applicable) and the e2e doc has been updated, verify the feature behaves correctly if there's a way to check beyond tests (e.g., a script output, a CLI invocation, a UI check). Report to the user:
+
+> ✅ **Task complete — all tests pass, no regressions, e2e doc updated.**
 
 ---
 
 ### Step 6 — Commit + push + PR flow (per change)
 
-After each **working task** (Step 5e confirmed), apply the **push trigger** before doing anything. Per POLICY, a commit + push happens **if and only if all five** are true for the change just made:
+After each **working task** (Step 5f confirmed), apply the **push trigger** before doing anything. Per POLICY, a commit + push happens **if and only if all five** are true for the change just made:
 
 1. Unit tests pass
 2. The relevant integration test passes
-3. End-to-end scenarios pass (recommend 2 happy + 1 sad)
-4. README / docs updated in the same change
+3. End-to-end scenarios pass (2 happy + 1 sad minimum) AND documented in `docs/e2e/<feature-name>-YYYY-MM-DD.md` — OR explicitly skipped per Step 5e with the reason recorded in the commit body
+4. README / docs updated in the same change (including `docs/e2e/<feature-name>-YYYY-MM-DD.md` when the task added or modified an e2e scenario)
 5. CHANGELOG `## [Unreleased]` bullet added
 
 If any fail → **do not commit, do not push.** Root-cause and fix first, then re-evaluate.
