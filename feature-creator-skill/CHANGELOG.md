@@ -8,6 +8,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `docs/e2e/`: retrospective e2e test plans for every shipped skill in the ai-skills repo (`clone-repo`, `explain-code`, `feature-creator-skill`, `secondbrain-notebooklm-skill`, `secondbrain-transcribe-audio-skill`, `session-backup`, `sync-skills`) — applies the new Step 5e convention to existing features so each one now has a `docs/e2e/<skill>-2026-05-23.md` spec covering 2 happy + 1 sad scenarios plus a "How to execute" section describing what would need to land to make them runnable
 - `SKILL.md`: new **Step 5e — End-to-end coverage and documentation** requiring 2 happy + 1 sad e2e scenarios per user-observable task, captured in `<feature_worktree_root>/docs/e2e/<feature-name>-YYYY-MM-DD.md` (one file per feature, dated at first creation, appended-to as the feature grows); includes the doc template, exemption rules for refactor/docs-only/test-only/config changes, and an end-to-end runner table (playwright / cypress / supertest / requests / bats / pipeline scripts)
 - `SKILL.md`: new **E2E doc** entry in the Definitions table
 - `SKILL.md`: full feature development workflow — worktree creation, pre-change confirmation gates, TDD loop with visible subprocess test runs, per-commit changelog updates, multi-repo session tracking, and superpowers offer for non-trivial scope
